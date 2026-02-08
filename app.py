@@ -3,15 +3,16 @@
 Lightweight Flask app that:
 1. Polls recentTrades with adaptive interval (5-10s), candles every 60s
 2. Stores in PostgreSQL (Render) with SQLite fallback for local dev
-3. Exposes /health, /stats, /trades, /candles endpoints
+3. Exposes /health, /stats, /trades, /candles, /gaps endpoints
 4. Self-pings every 10 min to prevent Render free-tier spin-down
-5. Watchdog restarts dead collector threads automatically
-6. Gap detection via tid tracking + gap event logging
+5. Watchdog restarts dead threads; fail-fast restarts the process if the collector loop wedges
+6. Best-effort gap detection via recentTrades window overflow (anchor overlap) + gap event logging
 7. Discord webhook alerting (down, stale, crash loop, gaps)
 8. TRADING_ENABLED kill switch for downstream consumers
 """
 
 import os
+import signal
 import threading
 import time
 import logging
@@ -34,7 +35,14 @@ SELF_PING_INTERVAL = 600 # 10 min
 WATCHDOG_INTERVAL = 30   # check thread health every 30s
 MAX_RETRIES = 3
 BASE_DELAY = 0.25
-HEARTBEAT_STALE_SECS = 120  # collector wedged if no heartbeat for 2 min
+
+# Health/staleness thresholds
+TRADE_STALE_SECS = 300          # 5 min without successful poll
+CANDLE_DATA_STALE_SECS = 600    # 10 min behind latest candle timestamp
+HEARTBEAT_STALE_SECS = 120      # collector wedged if no heartbeat for 2 min
+GAP_ALERT_COOLDOWN_SECS = 300   # rate limit gap alerts to Discord
+STARTUP_GRACE_SECS = 30         # allow boot time before flagging staleness
+STALE_ALERT_COOLDOWN_SECS = 300 # rate limit stale alerts to Discord
 
 # Database config
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -53,7 +61,8 @@ TRADING_ENABLED = os.environ.get("TRADING_ENABLED", "1") == "1"
 if USE_POSTGRES:
     import psycopg2
     import psycopg2.extras
-    log.info("Using PostgreSQL: %s...%s", DATABASE_URL[:30], DATABASE_URL[-15:])
+    # Never log DATABASE_URL (contains credentials).
+    log.info("Using PostgreSQL (DATABASE_URL set)")
 else:
     import sqlite3
     DB_PATH = "/tmp/collector.db"
@@ -217,7 +226,8 @@ def hl_post(payload: dict, timeout: float = 10.0):
 
 
 def fetch_trades(coin=COIN):
-    return hl_post({"type": "recentTrades", "coin": coin}) or []
+    # Important: return None on failure so the collector can mark itself unhealthy.
+    return hl_post({"type": "recentTrades", "coin": coin})
 
 
 def fetch_candles(coin=COIN, start_ms=None, end_ms=None):
@@ -231,7 +241,8 @@ def fetch_candles(coin=COIN, start_ms=None, end_ms=None):
         req["endTime"] = now_ms
     if not start_ms:
         req["startTime"] = now_ms - (6 * 3600 * 1000)
-    return hl_post({"type": "candleSnapshot", "req": req}) or []
+    # Important: return None on failure so the collector can mark itself unhealthy.
+    return hl_post({"type": "candleSnapshot", "req": req})
 
 
 def fetch_mid_price(coin=COIN):
@@ -347,8 +358,11 @@ def get_candle_count(conn):
         return conn.execute("SELECT COUNT(*) FROM candles_5m").fetchone()[0]
 
 
-def store_gap_event(conn, coin, last_tid, next_tid, estimated_missing, severity):
-    """Record a detected data gap."""
+def store_gap_event(conn, coin, last_tid, next_tid, estimated_missing, severity, *, send_alert: bool = True):
+    """Record a detected data gap.
+
+    Note: "estimated_missing" may be -1 to mean "unknown" (e.g., recentTrades window overflow).
+    """
     now_ms = int(time.time() * 1000)
     if USE_POSTGRES:
         cur = conn.cursor()
@@ -368,11 +382,15 @@ def store_gap_event(conn, coin, last_tid, next_tid, estimated_missing, severity)
         conn.commit()
     log.warning("GAP DETECTED: %s tids %d -> %d (est. %d missing, %s)",
                 coin, last_tid, next_tid, estimated_missing, severity)
-    send_discord_alert(
-        f"**Data Gap Detected**\nCoin: {coin}\n"
-        f"Last tid: {last_tid} -> Next tid: {next_tid}\n"
-        f"Estimated missing: {estimated_missing}\nSeverity: {severity}"
-    )
+    if send_alert:
+        title = "**Data Gap Detected**"
+        if int(estimated_missing) == -1:
+            title = "**Possible Data Gap (recentTrades window overflow)**"
+        send_discord_alert(
+            f"{title}\nCoin: {coin}\n"
+            f"Last tid: {last_tid} -> Next tid: {next_tid}\n"
+            f"Estimated missing: {estimated_missing}\nSeverity: {severity}"
+        )
 
 # ---------------------------------------------------------------------------
 # Discord alerting
@@ -395,11 +413,15 @@ def send_discord_alert(message: str):
 
 collector_stats = {
     "started_at": None,
+    "started_s": None,
     "total_trades": 0,
     "total_candles": 0,
     "total_gaps": 0,
     "last_trade_poll": None,
+    "last_trade_success_s": None,
     "last_candle_poll": None,
+    "last_candle_success_s": None,
+    "last_candle_ts_ms": None,
     "last_price": 0.0,
     "polls": 0,
     "errors": 0,
@@ -407,9 +429,15 @@ collector_stats = {
     "collector_alive": False,
     "pinger_alive": False,
     "last_heartbeat": None,
+    "last_stale_alert_s": None,
     "db_type": "postgres" if USE_POSTGRES else "sqlite",
+    "db_connected": False,
+    "db_last_ok_s": None,
     "trading_enabled": TRADING_ENABLED,
     "last_max_tid": None,
+    "trade_anchor": None,  # {"tid": int, "time": int} for overflow detection
+    "last_trade_batch_size": None,
+    "last_gap_alert_s": None,
     "current_poll_interval": 10.0,
 }
 
@@ -425,6 +453,8 @@ def collector_loop():
 
     try:
         conn = get_db()
+        collector_stats["db_connected"] = True
+        collector_stats["db_last_ok_s"] = time.time()
     except Exception as exc:
         log.error("DB connection failed: %s", exc)
         send_discord_alert(f"**DB Connection Failed**: {exc}")
@@ -440,7 +470,9 @@ def collector_loop():
         log.error("Backfill failed: %s", exc)
 
     collector_stats["started_at"] = datetime.now(timezone.utc).isoformat()
+    collector_stats["started_s"] = time.time()
     try:
+        collector_stats["total_trades"] = get_trade_count(conn)
         collector_stats["total_candles"] = get_candle_count(conn)
     except Exception:
         pass
@@ -475,50 +507,109 @@ def collector_loop():
 
     while True:
         try:
-            # Poll trades
+            # Poll trades (treat HL API failures as unhealthy; do NOT mask as empty batch)
             trades = fetch_trades()
+            collector_stats["last_trade_poll"] = datetime.now(timezone.utc).isoformat()
+            collector_stats["polls"] += 1
+
+            if trades is None:
+                collector_stats["errors"] += 1
+                log.warning("HL recentTrades poll failed; leaving last_trade_success_s unchanged")
+                collector_stats["last_trade_batch_size"] = None
+            else:
+                collector_stats["last_trade_success_s"] = time.time()
+                collector_stats["last_trade_batch_size"] = len(trades)
+
+            overflow_detected = False
             if trades:
-                # Gap detection: check if tids are contiguous
-                incoming_tids = sorted(int(t["tid"]) for t in trades if "tid" in t)
-                if incoming_tids and collector_stats["last_max_tid"] is not None:
-                    min_incoming = incoming_tids[0]
-                    last_max = collector_stats["last_max_tid"]
-                    if min_incoming > last_max + 1:
-                        gap_size = min_incoming - last_max - 1
-                        severity = "warning" if gap_size < 100 else "critical"
-                        store_gap_event(conn, COIN, last_max, min_incoming, gap_size, severity)
+                # Gap/overflow detection for recentTrades:
+                # - Hyperliquid trade IDs (tid) are unique identifiers but NOT guaranteed contiguous/monotonic.
+                # - Detect potential missed trades by verifying overlap with the previous poll's "anchor" trade.
+                #   If the previous anchor is not present in the current batch, the API window may have overflowed.
+                current_ids = set()
+                for t in trades:
+                    if "tid" in t and "time" in t:
+                        try:
+                            current_ids.add((int(t["tid"]), int(t["time"])))
+                        except (TypeError, ValueError):
+                            continue
+
+                prev_anchor = collector_stats.get("trade_anchor")
+                if prev_anchor and current_ids:
+                    prev_id = (int(prev_anchor["tid"]), int(prev_anchor["time"]))
+                    if prev_id not in current_ids:
+                        overflow_detected = True
+                        # We can't know exact missing count without a monotonic sequence; use -1 = unknown.
+                        severity = "critical" if poll_interval <= 5.0 else "warning"
+                        newest = max(current_ids, key=lambda x: x[1])
+                        now_s = time.time()
+                        last_gap_alert_s = collector_stats.get("last_gap_alert_s")
+                        should_alert = (
+                            last_gap_alert_s is None or
+                            (now_s - float(last_gap_alert_s)) >= GAP_ALERT_COOLDOWN_SECS or
+                            severity == "critical"
+                        )
+                        store_gap_event(
+                            conn,
+                            COIN,
+                            prev_id[0],
+                            newest[0],
+                            -1,
+                            severity,
+                            send_alert=should_alert,
+                        )
                         collector_stats["total_gaps"] += 1
+                        if should_alert:
+                            collector_stats["last_gap_alert_s"] = now_s
+                        # Push polling faster immediately.
+                        poll_interval = 5.0
+                        collector_stats["current_poll_interval"] = poll_interval
 
                 # Store trades
                 new_trades = store_trades(trades, conn)
                 collector_stats["total_trades"] += new_trades
+                collector_stats["db_connected"] = True
+                collector_stats["db_last_ok_s"] = time.time()
 
                 # Update last_max_tid
-                if incoming_tids:
-                    max_incoming = incoming_tids[-1]
+                if current_ids:
+                    max_incoming_tid = max(current_ids, key=lambda x: x[0])[0]
                     if (collector_stats["last_max_tid"] is None or
-                            max_incoming > collector_stats["last_max_tid"]):
-                        collector_stats["last_max_tid"] = max_incoming
+                            max_incoming_tid > collector_stats["last_max_tid"]):
+                        collector_stats["last_max_tid"] = max_incoming_tid
 
-                # Adaptive polling
-                if len(trades) > 50:
+                    # Update anchor to the most recent trade by timestamp.
+                    latest_tid, latest_time = max(current_ids, key=lambda x: x[1])
+                    collector_stats["trade_anchor"] = {"tid": latest_tid, "time": latest_time}
+
+            # Adaptive polling (keep 5s if overflow was detected in this batch)
+            if trades is not None:
+                if overflow_detected or (trades and len(trades) > 50):
                     poll_interval = 5.0
                 else:
                     poll_interval = 10.0
                 collector_stats["current_poll_interval"] = poll_interval
 
-            collector_stats["last_trade_poll"] = datetime.now(timezone.utc).isoformat()
-            collector_stats["polls"] += 1
-            collector_stats["last_heartbeat"] = time.time()
-
             # Poll candles every CANDLE_INTERVAL
             now = time.time()
             if now - last_candle_poll >= CANDLE_INTERVAL:
                 candles = fetch_candles()
-                new_candles = store_candles(candles, conn)
-                collector_stats["total_candles"] += new_candles
-                collector_stats["last_candle_poll"] = datetime.now(timezone.utc).isoformat()
-                last_candle_poll = now
+                if candles is None:
+                    collector_stats["errors"] += 1
+                    log.warning("HL candleSnapshot poll failed; leaving candle freshness unchanged")
+                else:
+                    new_candles = store_candles(candles, conn)
+                    collector_stats["total_candles"] += new_candles
+                    collector_stats["last_candle_poll"] = datetime.now(timezone.utc).isoformat()
+                    collector_stats["last_candle_success_s"] = time.time()
+                    collector_stats["db_connected"] = True
+                    collector_stats["db_last_ok_s"] = time.time()
+                    try:
+                        if candles:
+                            collector_stats["last_candle_ts_ms"] = max(int(c["t"]) for c in candles if "t" in c)
+                    except Exception:
+                        pass
+                    last_candle_poll = now
 
             # Price check every PRICE_INTERVAL
             if now - last_price_poll >= PRICE_INTERVAL:
@@ -539,10 +630,15 @@ def collector_loop():
                          collector_stats["errors"],
                          collector_stats["total_gaps"],
                          poll_interval)
+            # Loop heartbeat: updated once per successful iteration through the loop body.
+            collector_stats["last_heartbeat"] = time.time()
 
         except Exception as exc:
             collector_stats["errors"] += 1
             log.error("Collector error: %s", exc)
+            collector_stats["db_connected"] = False
+            # The loop is still alive; update heartbeat so watchdog doesn't treat repeated errors as a wedge.
+            collector_stats["last_heartbeat"] = time.time()
             # Reconnect DB on error
             if USE_POSTGRES:
                 _reset_pg_conn()
@@ -596,8 +692,26 @@ def watchdog_loop():
             collector_wedged = (heartbeat is not None and
                                 time.time() - heartbeat > HEARTBEAT_STALE_SECS)
 
-            if collector_dead or collector_wedged:
-                reason = "dead" if collector_dead else "wedged (no heartbeat)"
+            if collector_wedged:
+                # If the collector thread is alive but no longer updating its heartbeat, it is
+                # likely wedged in a blocking call (network/DB). Starting another collector
+                # thread would create duplicate collectors in the same process. Fail-fast so
+                # Render/Gunicorn restarts the worker cleanly.
+                reason = "wedged (no heartbeat)"
+                send_discord_alert(
+                    f"**Collector Wedged**: no heartbeat for {int(time.time() - heartbeat)}s. "
+                    "Requesting process restart to avoid duplicate collectors."
+                )
+                log.error("Collector %s; sending SIGTERM to self (pid=%d)", reason, os.getpid())
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                finally:
+                    # If SIGTERM is ignored for any reason, hard-exit.
+                    time.sleep(2)
+                    os._exit(1)
+
+            if collector_dead:
+                reason = "dead"
                 collector_stats["collector_alive"] = False
                 collector_stats["restarts"] += 1
                 collector_stats["last_heartbeat"] = None
@@ -625,13 +739,44 @@ def watchdog_loop():
                     target=_safe_pinger, daemon=True, name="pinger")
                 _pinger_thread.start()
 
-        # Staleness alert: no successful poll within 5 min
-        hb = collector_stats.get("last_heartbeat")
-        if hb is not None and time.time() - hb > 300:
-            send_discord_alert(
-                f"**Stale Collector**: No successful poll in "
-                f"{int(time.time() - hb)}s. Last heartbeat: {hb}"
-            )
+        # Staleness alert: no successful trade poll within TRADE_STALE_SECS (rate-limited).
+        trade_ok_s = collector_stats.get("last_trade_success_s")
+        if trade_ok_s is None:
+            started_s = collector_stats.get("started_s")
+            started_age_s = None
+            if started_s is not None:
+                try:
+                    started_age_s = time.time() - float(started_s)
+                except (TypeError, ValueError):
+                    started_age_s = None
+            if started_age_s is not None and started_age_s > STARTUP_GRACE_SECS:
+                now_s = time.time()
+                last_alert_s = collector_stats.get("last_stale_alert_s")
+                should_alert = (
+                    last_alert_s is None or
+                    (now_s - float(last_alert_s)) >= STALE_ALERT_COOLDOWN_SECS
+                )
+                if should_alert:
+                    collector_stats["last_stale_alert_s"] = now_s
+                    send_discord_alert("**Stale Collector**: No successful trade poll since start.")
+
+        else:
+            try:
+                trade_ok_age_s = time.time() - float(trade_ok_s)
+            except (TypeError, ValueError):
+                trade_ok_age_s = None
+            if trade_ok_age_s is not None and trade_ok_age_s > TRADE_STALE_SECS:
+                now_s = time.time()
+                last_alert_s = collector_stats.get("last_stale_alert_s")
+                should_alert = (
+                    last_alert_s is None or
+                    (now_s - float(last_alert_s)) >= STALE_ALERT_COOLDOWN_SECS
+                )
+                if should_alert:
+                    collector_stats["last_stale_alert_s"] = now_s
+                    send_discord_alert(
+                        f"**Stale Collector**: No successful trade poll in {int(trade_ok_age_s)}s."
+                    )
 
 
 def _safe_collector():
@@ -670,28 +815,73 @@ def health():
 
     # Staleness indicators
     hb = collector_stats.get("last_heartbeat")
-    trade_stale = hb is not None and time.time() - hb > 300
-    candle_poll = collector_stats.get("last_candle_poll")
+    hb_age_s = None
+    if hb is not None:
+        try:
+            hb_age_s = time.time() - float(hb)
+        except (TypeError, ValueError):
+            hb_age_s = None
+
+    trade_ok_s = collector_stats.get("last_trade_success_s")
+    trade_ok_age_s = None
+    if trade_ok_s is not None:
+        try:
+            trade_ok_age_s = time.time() - float(trade_ok_s)
+        except (TypeError, ValueError):
+            trade_ok_age_s = None
+
+    started_s = collector_stats.get("started_s")
+    started_age_s = None
+    if started_s is not None:
+        try:
+            started_age_s = time.time() - float(started_s)
+        except (TypeError, ValueError):
+            started_age_s = None
+
+    trade_stale = False
+    if trade_ok_s is None:
+        if started_age_s is None or started_age_s > STARTUP_GRACE_SECS:
+            trade_stale = True
+    elif trade_ok_age_s is not None and trade_ok_age_s > TRADE_STALE_SECS:
+        trade_stale = True
+    now_ms = int(time.time() * 1000)
+    last_candle_ts_ms = collector_stats.get("last_candle_ts_ms")
+    candle_data_stale = (
+        last_candle_ts_ms is not None and (now_ms - int(last_candle_ts_ms)) > (CANDLE_DATA_STALE_SECS * 1000)
+    )
+
+    db_last_ok_s = collector_stats.get("db_last_ok_s")
+    db_last_ok_age_s = None
+    if db_last_ok_s is not None:
+        try:
+            db_last_ok_age_s = time.time() - float(db_last_ok_s)
+        except (TypeError, ValueError):
+            db_last_ok_age_s = None
+    db_connected = bool(collector_stats.get("db_connected"))
 
     status = "ok"
-    if not collector_alive:
+    if not collector_alive or not watchdog_alive:
+        status = "degraded"
+    elif not db_connected:
         status = "degraded"
     elif trade_stale:
         status = "stale"
+    elif candle_data_stale:
+        status = "stale"
 
-    return jsonify({
+    resp = dict(collector_stats)
+    resp.update({
         "status": status,
         "coin": COIN,
-        "db_type": "postgres" if USE_POSTGRES else "sqlite",
-        "db_connected": True,
-        "trading_enabled": TRADING_ENABLED,
         "watchdog_alive": watchdog_alive,
         "trade_poll_stale": trade_stale,
-        "last_trade_poll": collector_stats.get("last_trade_poll"),
-        "last_candle_poll": candle_poll,
-        "current_poll_interval": collector_stats.get("current_poll_interval", 10.0),
-        **collector_stats
+        "trade_ok_age_s": trade_ok_age_s,
+        "candle_data_stale": candle_data_stale,
+        "db_connected": db_connected,
+        "db_last_ok_age_s": db_last_ok_age_s,
+        "loop_heartbeat_age_s": hb_age_s,
     })
+    return jsonify(resp)
 
 
 @app.route("/stats")
@@ -711,8 +901,8 @@ def get_trades():
         cur = conn.cursor()
         cur.execute(
             "SELECT tid, coin, side, px, sz, ts_ms FROM trades "
-            "WHERE ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
-            (since, limit)
+            "WHERE coin = %s AND ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
+            (COIN, since, limit)
         )
         rows = cur.fetchall()
         cur.close()
@@ -721,8 +911,8 @@ def get_trades():
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
             "SELECT tid,coin,side,px,sz,ts_ms FROM trades "
-            "WHERE ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
-            (since, limit)
+            "WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
+            (COIN, since, limit)
         ).fetchall()
         conn.close()
 
@@ -745,8 +935,8 @@ def get_candles():
         cur = conn.cursor()
         cur.execute(
             "SELECT ts_ms, coin, open, high, low, close, volume FROM candles_5m "
-            "WHERE ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
-            (since, limit)
+            "WHERE coin = %s AND interval = '5m' AND ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
+            (COIN, since, limit)
         )
         rows = cur.fetchall()
         cur.close()
@@ -755,8 +945,8 @@ def get_candles():
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
             "SELECT ts_ms,coin,open,high,low,close,volume FROM candles_5m "
-            "WHERE ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
-            (since, limit)
+            "WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
+            (COIN, since, limit)
         ).fetchall()
         conn.close()
 
@@ -836,7 +1026,10 @@ def start_background_threads():
                        ("postgres" if USE_POSTGRES else "sqlite"))
 
 
-start_background_threads()
+if os.environ.get("DISABLE_BACKGROUND_THREADS", "0") == "1":
+    log.info("Background threads disabled via DISABLE_BACKGROUND_THREADS=1")
+else:
+    start_background_threads()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
