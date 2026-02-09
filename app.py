@@ -1290,15 +1290,19 @@ def get_trades():
     since = request.args.get("since_ms", 0, type=int)
     limit = request.args.get("limit", 1000, type=int)
     limit = min(limit, 10000)
+    order = (request.args.get("order", "desc", type=str) or "desc").lower().strip()
+    if order not in ("asc", "desc"):
+        order = "desc"
+    order_sql = "ASC" if order == "asc" else "DESC"
 
     _init_db()
     if USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            "SELECT tid, coin, side, px, sz, ts_ms FROM trades "
-            "WHERE coin = %s AND ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
-            (COIN, since, limit)
+            f"SELECT tid, coin, side, px, sz, ts_ms FROM trades "
+            f"WHERE coin = %s AND ts_ms >= %s ORDER BY ts_ms {order_sql} LIMIT %s",
+            (COIN, since, limit),
         )
         rows = cur.fetchall()
         cur.close()
@@ -1306,9 +1310,9 @@ def get_trades():
     else:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
-            "SELECT tid,coin,side,px,sz,ts_ms FROM trades "
-            "WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
-            (COIN, since, limit)
+            f"SELECT tid,coin,side,px,sz,ts_ms FROM trades "
+            f"WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms {order_sql} LIMIT ?",
+            (COIN, since, limit),
         ).fetchall()
         conn.close()
 
@@ -1324,15 +1328,19 @@ def get_candles():
     since = request.args.get("since_ms", 0, type=int)
     limit = request.args.get("limit", 5000, type=int)
     limit = min(limit, 5000)
+    order = (request.args.get("order", "desc", type=str) or "desc").lower().strip()
+    if order not in ("asc", "desc"):
+        order = "desc"
+    order_sql = "ASC" if order == "asc" else "DESC"
 
     _init_db()
     if USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            "SELECT ts_ms, coin, open, high, low, close, volume FROM candles_5m "
-            "WHERE coin = %s AND interval = '5m' AND ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
-            (COIN, since, limit)
+            f"SELECT ts_ms, coin, open, high, low, close, volume FROM candles_5m "
+            f"WHERE coin = %s AND interval = '5m' AND ts_ms >= %s ORDER BY ts_ms {order_sql} LIMIT %s",
+            (COIN, since, limit),
         )
         rows = cur.fetchall()
         cur.close()
@@ -1340,9 +1348,9 @@ def get_candles():
     else:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
-            "SELECT ts_ms,coin,open,high,low,close,volume FROM candles_5m "
-            "WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
-            (COIN, since, limit)
+            f"SELECT ts_ms,coin,open,high,low,close,volume FROM candles_5m "
+            f"WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms {order_sql} LIMIT ?",
+            (COIN, since, limit),
         ).fetchall()
         conn.close()
 
@@ -1358,14 +1366,18 @@ def get_hlp():
     since = request.args.get("since_ms", 0, type=int)
     limit = request.args.get("limit", 1000, type=int)
     limit = min(limit, 10000)
+    order = (request.args.get("order", "desc", type=str) or "desc").lower().strip()
+    if order not in ("asc", "desc"):
+        order = "desc"
+    order_sql = "ASC" if order == "asc" else "DESC"
 
     _init_db()
     if USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            "SELECT ts_ms, net_btc, net_usd, strat_a_btc, strat_b_btc, total_acv "
-            "FROM hlp_snapshots WHERE ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
+            f"SELECT ts_ms, net_btc, net_usd, strat_a_btc, strat_b_btc, total_acv "
+            f"FROM hlp_snapshots WHERE ts_ms >= %s ORDER BY ts_ms {order_sql} LIMIT %s",
             (since, limit),
         )
         rows = cur.fetchall()
@@ -1374,8 +1386,8 @@ def get_hlp():
     else:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
-            "SELECT ts_ms, net_btc, net_usd, strat_a_btc, strat_b_btc, total_acv "
-            "FROM hlp_snapshots WHERE ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
+            f"SELECT ts_ms, net_btc, net_usd, strat_a_btc, strat_b_btc, total_acv "
+            f"FROM hlp_snapshots WHERE ts_ms >= ? ORDER BY ts_ms {order_sql} LIMIT ?",
             (since, limit),
         ).fetchall()
         conn.close()
@@ -1400,14 +1412,18 @@ def get_oi():
     limit = min(limit, 10000)
     coin = request.args.get("coin", "BTC", type=str)
     coin = (coin or "BTC").upper()
+    order = (request.args.get("order", "desc", type=str) or "desc").lower().strip()
+    if order not in ("asc", "desc"):
+        order = "desc"
+    order_sql = "ASC" if order == "asc" else "DESC"
 
     _init_db()
     if USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            "SELECT ts_ms, coin, open_interest, funding_rate, mark_px, oracle_px, day_ntl_vlm, premium "
-            "FROM oi_snapshots WHERE coin = %s AND ts_ms >= %s ORDER BY ts_ms DESC LIMIT %s",
+            f"SELECT ts_ms, coin, open_interest, funding_rate, mark_px, oracle_px, day_ntl_vlm, premium "
+            f"FROM oi_snapshots WHERE coin = %s AND ts_ms >= %s ORDER BY ts_ms {order_sql} LIMIT %s",
             (coin, since, limit),
         )
         rows = cur.fetchall()
@@ -1416,8 +1432,8 @@ def get_oi():
     else:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         rows = conn.execute(
-            "SELECT ts_ms, coin, open_interest, funding_rate, mark_px, oracle_px, day_ntl_vlm, premium "
-            "FROM oi_snapshots WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms DESC LIMIT ?",
+            f"SELECT ts_ms, coin, open_interest, funding_rate, mark_px, oracle_px, day_ntl_vlm, premium "
+            f"FROM oi_snapshots WHERE coin = ? AND ts_ms >= ? ORDER BY ts_ms {order_sql} LIMIT ?",
             (coin, since, limit),
         ).fetchall()
         conn.close()
