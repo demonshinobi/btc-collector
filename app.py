@@ -710,20 +710,25 @@ def collector_loop():
                         newest = max(current_ids, key=lambda x: x[1])
                         now_s = time.time()
                         last_gap_alert_s = collector_stats.get("last_gap_alert_s")
+                        # Rate-limit gap events (and Discord alerts) aggressively; otherwise
+                        # `recentTrades` (fixed window=10) will overflow constantly during active periods.
+                        #
+                        # IMPORTANT: We still count overflows in `total_gaps`, but we only
+                        # persist/log a gap event once per cooldown window to avoid noise.
                         should_alert = (
-                            last_gap_alert_s is None or
-                            (now_s - float(last_gap_alert_s)) >= GAP_ALERT_COOLDOWN_SECS or
-                            severity == "critical"
+                            last_gap_alert_s is None
+                            or (now_s - float(last_gap_alert_s)) >= GAP_ALERT_COOLDOWN_SECS
                         )
-                        store_gap_event(
-                            conn,
-                            COIN,
-                            prev_id[0],
-                            newest[0],
-                            -1,
-                            severity,
-                            send_alert=should_alert,
-                        )
+                        if should_alert:
+                            store_gap_event(
+                                conn,
+                                COIN,
+                                prev_id[0],
+                                newest[0],
+                                -1,
+                                severity,
+                                send_alert=True,
+                            )
                         collector_stats["total_gaps"] += 1
                         if should_alert:
                             collector_stats["last_gap_alert_s"] = now_s
